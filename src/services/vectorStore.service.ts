@@ -99,7 +99,7 @@ class VectorStoreService {
          return queryResponse.matches
             .filter((match): match is PineconeMatch & { score: number; metadata: Record<string, any> } => 
                match.score !== undefined && 
-               match.score > 0.7 && 
+               match.score >= 0.4 && 
                match.metadata !== undefined
             )
             .map(match => ({

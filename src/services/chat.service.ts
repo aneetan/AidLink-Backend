@@ -28,67 +28,105 @@ class ChatService {
       this.initialized = true;
    }
 
-    private extractJsonResponse(text: string): MedicalResponse | string {
-    try {
-      // Try to find JSON in the response
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        return JSON.parse(jsonMatch[0]);
-      }
-      
-      // If no JSON found, return fallback
-      return "I'm not sure how to help with that specific concern. If this is a medical emergency, please call emergency services immediately. Always consult with a healthcare professional for medical advice"
-      
-    } catch (error) {
-      console.error('Error parsing JSON response:', error);
-      return "I'm not sure how to help with that specific concern. If this is a medical emergency, please call emergency services immediately. Always consult with a healthcare professional for medical advice"
+    private extractJsonString(text: string): string | null {
+      const trimmed = text.trim();
 
+      try {
+        JSON.parse(trimmed);
+        return trimmed;
+      } catch {
+        // Not pure JSON, continue extraction
+      }
+
+      let inString = false;
+      let escaping = false;
+      let start = -1;
+      const stack: string[] = [];
+
+      for (let i = 0; i < trimmed.length; i++) {
+        const char = trimmed[i];
+
+        if (escaping) {
+          escaping = false;
+          continue;
+        }
+
+        if (char === '\\') {
+          escaping = true;
+          continue;
+        }
+
+        if (char === '"') {
+          inString = !inString;
+          continue;
+        }
+
+        if (inString) {
+          continue;
+        }
+
+        if (char === '{' || char === '[') {
+          if (stack.length === 0) {
+            start = i;
+          }
+          stack.push(char);
+          continue;
+        }
+
+        if (char === '}' || char === ']') {
+          const last = stack[stack.length - 1];
+          if ((char === '}' && last === '{') || (char === ']' && last === '[')) {
+            stack.pop();
+            if (stack.length === 0 && start !== -1) {
+              return trimmed.slice(start, i + 1);
+            }
+          } else {
+            stack.length = 0;
+            start = -1;
+          }
+        }
+      }
+
+      if (start !== -1) {
+        let candidate = trimmed.slice(start);
+        if (inString) {
+          candidate += '"';
+        }
+        while (stack.length > 0) {
+          const open = stack.pop();
+          candidate += open === '{' ? '}' : ']';
+        }
+        return candidate;
+      }
+
+      const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
+      return jsonMatch ? jsonMatch[0] : null;
     }
-   }
 
-    // Process a user message and generate a response
-    async processMessage(userMessage: string):  Promise<ChatResponse> {
-      if (!this.initialized) await this.initialize();
+    private extractJsonResponse(text: string): MedicalResponse | string {
+      const fallback = "I'm not sure how to help with that specific concern. If this is a medical emergency, please call emergency services immediately. Always consult with a healthcare professional for medical advice";
 
-      // Generate embedding for the user message
-      const queryEmbedding = await this.embeddingService.generateEmbeddings(userMessage);
+      try {
+        const jsonString = this.extractJsonString(text);
+        if (!jsonString) {
+          throw new Error('No JSON object found in response');
+        }
 
-      // Find similar intents
-      const similarIntents = await this.vectorStore.findSimilarVectors(queryEmbedding);
-
-      if (similarIntents.length === 0) {
-         return {
-         response: "I'm not sure how to help with that specific concern. If this is a medical emergency, please call emergency services immediately. Always consult with a healthcare professional for medical advice",
-         sources: []
-         };
+        const sanitized = jsonString.replace(/,\s*([}\]])/g, '$1');
+        return JSON.parse(sanitized);
+      } catch (error) {
+        console.error('Error parsing JSON response:', error, 'raw response:', text);
+        return fallback;
       }
+    }
 
-      // Prepare context from similar intents
-      const context = similarIntents.map(item => {
-         const intent = item.intent;
-         const steps = intent.response.steps.map(step => 
-         `${step.step_number}. ${step.instruction}`
-         ).join('\n');
-         
-         return `
-            TOPIC: ${intent.intent_name}
-            CONTEXT: ${intent.response.context || 'No additional context'}
-            STEPS:
-            ${steps}
-            NOTES: ${intent.response.additional_notes || 'No additional notes'}
-            WARNINGS: ${intent.metadata.warnings.join('; ')}
-            SOURCE: ${intent.metadata.source}
-            `;
-      }).join('\n\n');
-
-      // Generate response using Gemini
-      const model = getGenerativeModel();
-      const prompt = `
+    private buildPrompt(userMessage: string, context: string): string {
+      return `
          You are a first aid assistant. Use the following context to answer the user's question.
          Always prioritize safety and recommend seeking professional medical help when appropriate.
 
          Context information from our first aid database:
-         ${context}
+         ${context || 'No matching context found. Answer using general first aid principles.'}
 
          User question: "${userMessage}"
 
@@ -125,7 +163,6 @@ class ChatService {
          - Always include emergency action guidance
          - If context doesn't contain relevant information, use general first aid principles
          - DO NOT include any text outside the JSON structure
-         - Start with a brief introduction if needed
          - End with a recommendation to seek professional medical help
 
          Important formatting rules:
@@ -135,29 +172,65 @@ class ChatService {
          - Keep the language simple and easy to understand
          - If the context doesn't contain relevant information, acknowledge this and suggest contacting medical professionals.
       `;
+    }
 
-       try {
-         const result = await model.generateContent(prompt);
-         const response = await result.response;
-         const text = response.text();
+    private async callGenerativeModel(prompt: string): Promise<MedicalResponse | string> {
+      try {
+        const model = getGenerativeModel();
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        const text = response.text();
+        return this.extractJsonResponse(text);
+      } catch (error) {
+        console.error('Error generating response:', error);
+        return "I'm not sure how to help with that specific concern. If this is a medical emergency, please call emergency services immediately. Always consult with a healthcare professional for medical advice";
+      }
+    }
 
-         const formattedResponse = this.extractJsonResponse(text);
+    // Process a user message and generate a response
+    async processMessage(userMessage: string):  Promise<ChatResponse> {
+      if (!this.initialized) await this.initialize();
+
+      // Generate embedding for the user message
+      const queryEmbedding = await this.embeddingService.generateEmbeddings(userMessage);
+
+      // Find similar intents
+      const similarIntents = await this.vectorStore.findSimilarVectors(queryEmbedding);
+
+      if (similarIntents.length === 0) {
+         console.log('No similar intents found, generating a general first aid response.');
+      }
+
+      // Prepare context from similar intents
+      const context = similarIntents.map(item => {
+         const intent = item.intent;
+         const steps = intent.response.steps.map(step => 
+         `${step.step_number}. ${step.instruction}`
+         ).join('\n');
          
-         return {
+         return `
+            TOPIC: ${intent.intent_name}
+            CONTEXT: ${intent.response.context || 'No additional context'}
+            STEPS:
+            ${steps}
+            NOTES: ${intent.response.additional_notes || 'No additional notes'}
+            WARNINGS: ${intent.metadata.warnings.join('; ')}
+            SOURCE: ${intent.metadata.source}
+            `;
+      }).join('\n\n');
+
+      const prompt = this.buildPrompt(userMessage, context);
+
+      const formattedResponse = await this.callGenerativeModel(prompt);
+
+      return {
          response: formattedResponse,
          sources: similarIntents.map(item => ({
             intent: item.intent.intent_name,
             similarity: item.similarity,
             source: item.intent.metadata.source
          }))
-         };
-      } catch (error) {
-         console.error('Error generating response:', error);
-         return {
-         response: "I'm not sure how to help with that specific concern. If this is a medical emergency, please call emergency services immediately. Always consult with a healthcare professional for medical advice",
-         sources: []
       };
-   }
    }
 }
 
