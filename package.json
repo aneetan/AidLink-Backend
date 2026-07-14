@@ -4,7 +4,7 @@
   "description": "Server-side for AI-powered First Aid Chatbot with voice search and real-time local health camp information.",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc && npm run build",
+    "build": "tsc",
     "start": "node dist/index.js",
     "dev": "nodemon src/index.ts",
     "test": "jest --passWithNoTests"
